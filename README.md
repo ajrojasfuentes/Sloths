@@ -1,2 +1,2 @@
 # Sloths
-A high-end &amp; high-performance AI/ML data framework for heterogeneous, multidimensional, and multimodal datasets, powered by the Python Array API standard.
+A high-end &amp; high-performance dataset analysis and manipulation framework for heterogeneous, multidimensional, and multimodal datasets, powered by JAX and based on the Python Array API standard.
