@@ -729,6 +729,196 @@ TensorFrame → TensorFlow: frame.to_tf_tensors() (vía DLPack)
 
 ---
 
+## 9.1 Profundización de Diseño: Áreas Complementarias
+
+Las siguientes secciones abordan aspectos del diseño que requieren especificación adicional para garantizar robustez en la implementación.
+
+### 9.1.1 Manejo de Errores y Validación en el Storage Layer
+
+El Storage Layer de 3 capas introduce múltiples puntos de falla que deben manejarse de forma predecible.
+
+**Jerarquía de excepciones:**
+
+```
+TensorFrameError (base)
+├── SchemaError
+│   ├── SchemaValidationError      # Esquema inválido al construir
+│   ├── SchemaMismatchError        # Esquemas incompatibles en merge/concat
+│   └── SchemaEvolutionError       # Migración de esquema fallida
+├── StorageError
+│   ├── MaterializationError       # Fallo al promover Cold/Warm → Hot
+│   ├── ChunkCorruptionError       # Checksum inválido al leer chunk
+│   ├── IOTimeoutError             # Timeout en operación de I/O
+│   ├── DeviceMemoryError          # Sin memoria en dispositivo para materializar
+│   └── PersistenceError           # Fallo al escribir a Cold storage
+├── ComputeError
+│   ├── ShapeError                 # Formas incompatibles en operación
+│   ├── DtypeError                 # Tipos incompatibles
+│   └── JITTraceError              # Error durante trazado JIT
+└── IndexError
+    ├── LabelNotFoundError         # Etiqueta no existe en Index
+    └── DimensionError             # Dimensión referenciada no existe
+```
+
+**Políticas de recuperación por nivel de storage:**
+
+| Nivel | Tipo de fallo | Política |
+|---|---|---|
+| Hot → Warm (eviction) | DeviceMemoryError | Retry con eviction LRU forzada; si falla, degradar campo más antiguo |
+| Warm → Hot (materialización) | IOTimeoutError | Retry con backoff exponencial (3 intentos, 1s/2s/4s); luego MaterializationError |
+| Cold → Warm (carga) | ChunkCorruptionError | Verificar checksum CRC32C; si falla, reportar chunk específico y ofrecer recarga parcial |
+| Hot → Cold (persistencia) | PersistenceError | Write-ahead log para operaciones parciales; retry atómico por chunk |
+
+**Validación de integridad:**
+
+Cada chunk en Zarr v3 almacena un checksum CRC32C en sus metadatos. Al leer, TensorStore verifica el checksum antes de decodificar. Si falla:
+1. Se marca el chunk como corrupto en un registro interno.
+2. Se intenta releer desde el backend de storage (por si fue un error transitorio de red).
+3. Si persiste, se lanza `ChunkCorruptionError` con la posición del chunk y su ruta en el store.
+
+### 9.1.2 Concurrencia y Thread-Safety
+
+**Modelo de concurrencia:**
+
+TensorFrame adopta un modelo de **inmutabilidad + message passing** que minimiza la necesidad de locks:
+
+- **Lecturas concurrentes:** Seguras por diseño. Los TensorFrames son inmutables, por lo que múltiples threads pueden leer simultáneamente sin riesgo de data races.
+- **Escrituras a Cold storage:** Delegadas a TensorStore, que implementa **optimistic concurrency** con transacciones por chunk. Dos procesos pueden escribir chunks distintos del mismo array simultáneamente.
+- **Escrituras concurrentes al mismo chunk:** TensorStore usa compare-and-swap a nivel de storage backend. Si hay conflicto, el escritor más lento recibe un error de concurrencia y debe reintentar.
+
+**Coordinación entre threads Python:**
+
+```
+ThreadPool (I/O)          ThreadPool (Cómputo)        Thread Principal
+     │                          │                           │
+     │  fetch chunks async      │                           │
+     │◄─────────────────────────┼───────────────────────────┤ request data
+     │                          │                           │
+     │  decode + decompress     │                           │
+     ├─────────────────────────►│  device_put (DMA)         │
+     │                          ├──────────────────────────►│ datos listos
+     │                          │                           │ ejecutar kernel
+```
+
+- El GIL de Python se libera durante operaciones de I/O (TensorStore es C++) y durante cómputo JAX (XLA ejecuta fuera del GIL).
+- El `asyncio` event loop de Zarr-Python 3 se ejecuta en un thread dedicado, evitando bloquear el thread principal.
+
+**Multi-proceso:**
+
+Para acceso desde múltiples procesos Python (e.g., workers de un DataLoader):
+- Cada proceso abre su propia instancia de TensorStore con su propio cache pool.
+- Las escrituras usan el mecanismo de optimistic concurrency de TensorStore.
+- No se comparte estado mutable entre procesos; cada uno tiene su propia copia de los metadatos del TensorFrame.
+
+### 9.1.3 Memory Budget y Backpressure
+
+**Monitoreo de memoria del dispositivo:**
+
+```python
+@dataclass(frozen=True)
+class MemoryBudget:
+    device_limit: int          # Bytes máximos en device memory (auto-detectado o configurable)
+    host_cache_limit: int      # Bytes máximos para TensorStore cache pool
+    high_watermark: float      # Fracción (e.g., 0.85) para iniciar eviction proactiva
+    low_watermark: float       # Fracción (e.g., 0.65) objetivo tras eviction
+    prefetch_budget: float     # Fracción reservada para prefetch (e.g., 0.15)
+```
+
+**Mecanismo de backpressure:**
+
+Cuando la memoria del dispositivo supera `high_watermark`:
+
+1. **Pausa de prefetch:** Se suspenden las lecturas anticipadas de `iter_batches()`.
+2. **Eviction LRU:** Se identifican los campos Hot menos recientemente usados y se degradan a Warm (los datos persisten en el cache de TensorStore).
+3. **Materialización bloqueante:** Si un campo necesita materializarse pero no hay espacio, se fuerza eviction de otros campos hasta alcanzar `low_watermark`.
+4. **Error terminal:** Si tras evictar todo lo posible no hay espacio suficiente, se lanza `DeviceMemoryError` con un mensaje que indica el tamaño requerido vs. disponible.
+
+**Tracking de uso:**
+
+Cada campo Hot mantiene un timestamp de último acceso. Un `MemoryManager` singleton (por dispositivo) rastrea:
+- Bytes totales en uso por campos Hot.
+- Orden LRU de campos.
+- Bytes reservados para prefetch.
+
+### 9.1.4 Estrategia de Testing
+
+**Niveles de testing:**
+
+| Nivel | Alcance | Herramientas |
+|---|---|---|
+| **Unitario** | NDType, NDSchema, Index, FieldSpec individuales | pytest, hypothesis (property-based) |
+| **Integración** | TensorFrame con operaciones completas, pytree round-trips | pytest, jax.test_util |
+| **Property-based** | Invariantes de esquema, idempotencia de serialización, roundtrip pytree | hypothesis con estrategias custom |
+| **Transformaciones JAX** | Compatibilidad con jit/grad/vmap/pmap sobre TensorFrames | Tests parametrizados por transformación |
+| **Storage** | Round-trip Hot↔Warm↔Cold, integridad de chunks, concurrencia | pytest con fixtures de TensorStore/Zarr en memoria |
+| **Fuzzing** | Esquemas aleatorios, datos edge-case (NaN, inf, empty, max-size) | hypothesis |
+| **Performance** | Benchmarks de overhead vs JAX directo, throughput de I/O | pytest-benchmark, asv |
+
+**Invariantes a verificar en todo test de TensorFrame:**
+
+1. `tree_unflatten(*tree_flatten(frame))` produce un frame idéntico al original.
+2. Toda operación que retorna un TensorFrame produce un frame con esquema válido.
+3. Los metadatos (schema, indices, dim_order) sobreviven intactos a jit/vmap/grad.
+4. La serialización a JSON de NDSchema es idempotente: `from_json(to_json(schema)) == schema`.
+
+### 9.1.5 Serialización del LazyExpr Graph
+
+El grafo de expresiones lazy puede serializarse para:
+- **Checkpointing de pipelines:** Guardar un pipeline de transformaciones sin materializar datos.
+- **Debugging:** Inspeccionar qué operaciones se van a ejecutar antes de materializar.
+- **Reproducibilidad:** Registrar la secuencia exacta de transformaciones aplicadas.
+
+**Formato de serialización:**
+
+```json
+{
+  "version": "1.0",
+  "nodes": [
+    {"id": 0, "op": "field_ref", "field": "precio"},
+    {"id": 1, "op": "scalar", "value": 1.16, "dtype": "float64"},
+    {"id": 2, "op": "mul", "inputs": [0, 1]},
+    {"id": 3, "op": "field_ref", "field": "impuesto"},
+    {"id": 4, "op": "add", "inputs": [2, 3]}
+  ],
+  "output": 4
+}
+```
+
+**Limitaciones:** Las funciones Python arbitrarias (e.g., lambdas en `.apply()`) no son serializables. En esos casos, el nodo se marca como `"op": "opaque_fn"` y el grafo no es reconstructible desde la serialización.
+
+### 9.1.6 Versionado y Migración de Esquema
+
+Cuando un dataset persistido en Zarr v3 necesita evolución de esquema:
+
+**Operaciones de migración soportadas:**
+
+| Operación | Compatibilidad | Implementación |
+|---|---|---|
+| Agregar campo con default | Backward compatible | Nuevo array Zarr; lecturas de datos antiguos retornan el default |
+| Eliminar campo | Forward compatible | Se marca como deprecated; el array Zarr se retiene pero se ignora |
+| Renombrar campo | Metadata-only | Actualización del JSON de esquema |
+| Cambiar dtype (widening) | Safe cast | Nuevo array con datos convertidos; validación de pérdida de precisión |
+| Cambiar dtype (narrowing) | Requiere confirmación | Validación explícita; falla si hay overflow |
+| Agregar dimensión | Breaking | Nuevo dataset; migración explícita |
+| Cambiar chunking | Storage-only | Re-chunk con `zarr.copy()` optimizado |
+
+**Metadatos de versión:**
+
+```json
+{
+  "tensorframe_version": "0.1.0",
+  "schema_version": 2,
+  "schema_history": [
+    {"version": 1, "timestamp": "2026-03-01T00:00:00Z", "changes": "initial"},
+    {"version": 2, "timestamp": "2026-03-15T00:00:00Z", "changes": "added field 'precio_iva'"}
+  ]
+}
+```
+
+Al abrir un dataset, TensorFrame compara la `schema_version` del archivo con la esperada. Si difieren, ofrece migración automática para operaciones backward-compatible o lanza `SchemaEvolutionError` con instrucciones para migraciones breaking.
+
+---
+
 ## 10. Conclusión
 
 TensorFrame propone una arquitectura que hereda la ergonomía de datos etiquetados de Pandas, la extiende a N dimensiones con soporte para tipos anidados (como Arrow), la acelera con JAX para cómputo en GPU/TPU, y la respalda con un Storage Layer de tres niveles que gestiona inteligentemente la materialización de datos según su temperatura de uso.

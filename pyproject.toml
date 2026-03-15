@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68.0", "setuptools-scm>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sloths-tensorframe"
+version = "0.1.0"
+description = "High-performance dataset analysis and manipulation framework for heterogeneous, multidimensional, and multimodal datasets, powered by JAX."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dependencies = [
+    "jax>=0.4.20",
+    "jaxlib>=0.4.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "hypothesis>=6.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["tensorframe*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
