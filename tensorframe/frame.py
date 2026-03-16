@@ -358,6 +358,81 @@ class TensorFrame:
             attrs=self._attrs,
         )
 
+    # --- Phase 3: Operations (delegated) ---
+
+    def groupby(self, by: str) -> Any:
+        """Group by a field, returning a GroupBy object for aggregation."""
+        from tensorframe.ops import GroupBy
+        return GroupBy(self, by)
+
+    def map(self, fn: Callable, dim: str | None = None) -> jnp.ndarray:
+        """Apply fn to each slice along a dimension, stacking results."""
+        from tensorframe.ops import map_over_dim
+        if dim is None:
+            dim = self._dim_order[0]
+        return map_over_dim(self, fn, dim)
+
+    # --- Phase 4: ML Pipeline (delegated) ---
+
+    def dropna(self, dim: str | None = None, fields: list[str] | None = None) -> TensorFrame:
+        """Drop elements with NaN values."""
+        from tensorframe.ml import dropna
+        return dropna(self, dim=dim, fields=fields)
+
+    def fillna(self, fill_values: dict[str, Any]) -> TensorFrame:
+        """Replace NaN values in specified fields."""
+        from tensorframe.ml import fillna
+        return fillna(self, fill_values)
+
+    def normalize(
+        self,
+        fields: list[str],
+        method: str = "zscore",
+        dim: str | tuple[str, ...] | None = None,
+        return_params: bool = False,
+    ) -> TensorFrame | tuple[TensorFrame, dict]:
+        """Normalize selected fields."""
+        from tensorframe.ml import normalize
+        return normalize(self, fields, method=method, dim=dim, return_params=return_params)
+
+    def encode_categorical(self, field_name: str, categories: list | None = None) -> TensorFrame:
+        """Encode a field as integer category codes."""
+        from tensorframe.ml import encode_categorical
+        return encode_categorical(self, field_name, categories=categories)
+
+    def one_hot(self, field_name: str, num_classes: int | None = None) -> TensorFrame:
+        """One-hot encode a categorical integer field."""
+        from tensorframe.ml import one_hot
+        return one_hot(self, field_name, num_classes=num_classes)
+
+    def split(
+        self, dim: str | None = None, ratios: list[float] | None = None,
+        shuffle: bool = True, seed: int = 42,
+    ) -> tuple[TensorFrame, ...]:
+        """Split into train/val/test subsets."""
+        from tensorframe.ml import split
+        return split(self, dim=dim, ratios=ratios, shuffle=shuffle, seed=seed)
+
+    def to_jax_arrays(self, features: list[str], target: str | None = None):
+        """Extract feature and target arrays for ML."""
+        from tensorframe.ml import to_jax_arrays
+        return to_jax_arrays(self, features, target=target)
+
+    def iter_batches(
+        self, batch_size: int, dim: str | None = None,
+        shuffle: bool = False, seed: int = 0, drop_last: bool = False,
+    ):
+        """Iterate over the frame in batches."""
+        from tensorframe.ml import iter_batches
+        return iter_batches(self, batch_size, dim=dim, shuffle=shuffle, seed=seed, drop_last=drop_last)
+
+    # --- Phase 2: Storage (delegated) ---
+
+    def save(self, path: str, chunk_config: dict | None = None) -> None:
+        """Save to Zarr v3 format on disk."""
+        from tensorframe.storage import save
+        save(self, path, chunk_config=chunk_config)
+
     # --- Conversion ---
 
     def to_dict(self) -> dict[str, jnp.ndarray]:
